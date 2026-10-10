@@ -1,0 +1,676 @@
+"""
+Settings management API routes.
+Handles user preferences and settings.
+"""
+
+from typing import Dict, Any, List, Optional, Tuple
+from fastapi import APIRouter, Depends, HTTPException, Query, status
+from datetime import datetime
+from pydantic import BaseModel
+import aiosqlite
+import asyncio
+import json
+import shutil
+from pathlib import Path
+
+from backend.utils import utc_now
+from backend.utils.logger import get_logger
+from backend.database.models import (
+    UserPreference, UserPreferenceCreate, UserPreferenceUpdate,
+    PreferenceType
+)
+
+logger = get_logger(__name__)
+from backend.api.dependencies import (
+    get_db, get_current_user_id
+)
+from backend.config import settings as app_settings
+
+router = APIRouter(prefix="/settings", tags=["settings"])
+
+
+class SettingsResponse(BaseModel):
+    """Response model for settings."""
+    preferences: Dict[str, Any]
+    categories: Dict[str, List[str]]
+
+
+class PreferenceResponse(BaseModel):
+    """Response model for a single preference."""
+    key: str
+    value: Any
+    type: PreferenceType
+    category: Optional[str]
+
+
+class BulkPreferenceUpdate(BaseModel):
+    """Request model for bulk preference updates."""
+    preferences: Dict[str, Any]
+
+
+class CliRegistryResponse(BaseModel):
+    """Response model for installer CLI registry."""
+    version: Optional[str] = None
+    last_updated: Optional[str] = None
+    clis: List[Dict[str, Any]]
+    custom_clis: List[Dict[str, Any]] = []  # user-defined CLIs
+
+
+class StorageAreaResponse(BaseModel):
+    """Filesystem storage area used by the local app."""
+    name: str
+    path: str
+    exists: bool
+    files: int
+    size_bytes: int
+    clearable: bool = False
+
+
+class StorageResponse(BaseModel):
+    """Local storage summary for privacy / maintenance UI."""
+    areas: List[StorageAreaResponse]
+    total_size_bytes: int
+
+
+class ClearCacheResponse(BaseModel):
+    """Result of clearing clearable generated cache/temp data."""
+    cleared_files: int
+    cleared_bytes: int
+    areas: List[StorageAreaResponse]
+
+
+# Default settings structure
+DEFAULT_SETTINGS = {
+    "theme": {
+        "mode": "dark",
+        "accent_color": "#3b82f6"
+    },
+    "editor": {
+        "font_size": 14,
+        "line_numbers": True,
+        "word_wrap": True,
+        "auto_save": True
+    },
+    "chat": {
+        "stream_responses": True,
+        "show_timestamps": True,
+        "code_highlighting": True,
+        "auto_scroll": True
+    },
+    "orchestrator": {
+        "default_routing": "auto",
+        "enable_fallback": True,
+        "max_retries": 3,
+        "timeout": 30
+    },
+    "notifications": {
+        "enable_sound": True,
+        "enable_desktop": False,
+        "show_errors": True
+    },
+    "privacy": {
+        "analytics_enabled": True,
+        "crash_reports": True
+    }
+}
+
+
+def _managed_storage_dirs() -> Dict[str, Tuple[Path, bool]]:
+    """Return app-owned storage paths and whether each can be cleared as cache."""
+    return {
+        "database": (app_settings.database_path, False),
+        "uploads": (app_settings.upload_dir, False),
+        "context_uploads": (app_settings.context_files_dir, False),
+        "artifacts": (app_settings.artifacts_dir, False),
+        "cache": (app_settings.cache_dir, True),
+        "temp": (app_settings.temp_dir, True),
+    }
+
+
+def _dir_stats(path: Path) -> Tuple[int, int]:
+    """Return file count and byte size for a file or directory without following symlinks."""
+    try:
+        if not path.exists():
+            return 0, 0
+        if path.is_file() or path.is_symlink():
+            return 1, path.lstat().st_size
+        files = 0
+        size = 0
+        for child in path.rglob("*"):
+            try:
+                if child.is_dir() and not child.is_symlink():
+                    continue
+                files += 1
+                size += child.lstat().st_size
+            except OSError:
+                continue
+        return files, size
+    except OSError:
+        return 0, 0
+
+
+def _storage_area(name: str, path: Path, clearable: bool) -> StorageAreaResponse:
+    resolved = path.resolve()
+    files, size_bytes = _dir_stats(resolved)
+    return StorageAreaResponse(
+        name=name,
+        path=str(resolved),
+        exists=resolved.exists(),
+        files=files,
+        size_bytes=size_bytes,
+        clearable=clearable,
+    )
+
+
+def _storage_response() -> StorageResponse:
+    areas = [
+        _storage_area(name, path, clearable)
+        for name, (path, clearable) in _managed_storage_dirs().items()
+    ]
+    return StorageResponse(
+        areas=areas,
+        total_size_bytes=sum(area.size_bytes for area in areas),
+    )
+
+
+def _clear_directory_contents(root: Path) -> Tuple[int, int]:
+    """Delete children inside root after resolving containment; never deletes root."""
+    root = root.resolve()
+    root.mkdir(parents=True, exist_ok=True)
+    cleared_files = 0
+    cleared_bytes = 0
+
+    for child in list(root.iterdir()):
+        if child.name == ".gitkeep":
+            continue
+        try:
+            target = child.resolve()
+            if root != target and root not in target.parents:
+                continue
+            files, size_bytes = _dir_stats(child)
+            if child.is_dir() and not child.is_symlink():
+                shutil.rmtree(child)
+            else:
+                child.unlink(missing_ok=True)
+            cleared_files += files
+            cleared_bytes += size_bytes
+        except OSError:
+            continue
+
+    return cleared_files, cleared_bytes
+
+
+@router.get("/cli-registry", response_model=CliRegistryResponse)
+async def get_cli_registry(
+    db: aiosqlite.Connection = Depends(get_db),
+    _user_id: int = Depends(get_current_user_id),
+) -> CliRegistryResponse:
+    """
+    Get CLI registry used by installer/bootstrapper.
+    This keeps frontend CLI configuration aligned with system-level CLI definitions.
+
+    The response includes the bundled CLI list (`clis`) and any user-defined
+    custom CLIs (`custom_clis`) so callers (e.g. the agent picker) can render
+    built-ins and custom entries side by side without a second round-trip.
+    """
+    from backend.services.custom_cli_service import list_custom_clis_async
+
+    registry_path = (
+        Path(__file__).resolve().parents[3]
+        / "packaging"
+        / "bootstrapper"
+        / "cli_registry.json"
+    )
+
+    # Fetch user-defined CLIs from the custom_cli table (default to empty).
+    try:
+        custom_rows = await list_custom_clis_async(db, enabled_only=False)
+        custom_payload = [
+            {
+                "slug": r.slug,
+                "name": r.display_name,
+                "command": r.command,
+                "args_template": r.args_template,
+                "description": r.description,
+                "enabled": r.enabled,
+                "custom": True,
+                "created_at": r.created_at,
+                "updated_at": r.updated_at,
+            }
+            for r in custom_rows
+        ]
+    except Exception as exc:
+        # A schema mismatch or missing table shouldn't blow up the whole
+        # endpoint — bundled CLIs are still useful on their own.
+        logger.warning("Failed to load custom CLIs for cli-registry: %s", exc)
+        custom_payload = []
+
+    if not registry_path.exists():
+        default_clis = [
+            {"slug": "claude-code", "name": "Claude Code", "required": False},
+            {"slug": "gemini-cli", "name": "Gemini CLI", "required": False},
+            {"slug": "codex-cli", "name": "Codex CLI", "required": False},
+            {"slug": "copilot-cli", "name": "Copilot CLI", "required": False},
+        ]
+        return CliRegistryResponse(clis=default_clis, custom_clis=custom_payload)
+
+    try:
+        raw = registry_path.read_text(encoding="utf-8")
+        payload = json.loads(raw)
+    except OSError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Failed to read CLI registry: {exc}"
+        ) from exc
+    except json.JSONDecodeError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"CLI registry contains invalid JSON: {exc}"
+        ) from exc
+
+    clis = payload.get("clis")
+    if not isinstance(clis, list):
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="CLI registry is missing a valid 'clis' array"
+        )
+
+    version = payload.get("version")
+    return CliRegistryResponse(
+        version=str(version) if version is not None else None,
+        last_updated=str(payload.get("last_updated")) if payload.get("last_updated") is not None else None,
+        clis=clis,
+        custom_clis=custom_payload,
+    )
+
+
+def parse_preference_value(value: str, pref_type: PreferenceType) -> Any:
+    """Parse preference value based on type."""
+    if pref_type == PreferenceType.BOOLEAN:
+        return value.lower() in ('true', '1', 'yes')
+    elif pref_type == PreferenceType.NUMBER:
+        try:
+            return int(value) if '.' not in value else float(value)
+        except ValueError:
+            return 0
+    elif pref_type == PreferenceType.JSON:
+        try:
+            return json.loads(value)
+        except json.JSONDecodeError:
+            return {}
+    else:  # STRING
+        return value
+
+
+def serialize_preference_value(value: Any) -> Tuple[str, PreferenceType]:
+    """Serialize preference value and determine type."""
+    if isinstance(value, bool):
+        return (str(value).lower(), PreferenceType.BOOLEAN)
+    elif isinstance(value, (int, float)):
+        return (str(value), PreferenceType.NUMBER)
+    elif isinstance(value, (dict, list)):
+        return (json.dumps(value), PreferenceType.JSON)
+    else:
+        return (str(value), PreferenceType.STRING)
+
+
+@router.get("", response_model=SettingsResponse)
+async def get_settings(
+    db: aiosqlite.Connection = Depends(get_db),
+    user_id: int = Depends(get_current_user_id)
+) -> SettingsResponse:
+    """
+    Get all user settings.
+
+    Args:
+        db: Database connection
+        user_id: Current user ID
+
+    Returns:
+        User settings organized by category
+    """
+    cursor = await db.execute(
+        """
+        SELECT preference_key, preference_value, preference_type, category
+        FROM user_preferences
+        WHERE user_id = ?
+        ORDER BY category, preference_key
+        """,
+        (user_id,)
+    )
+    rows = await cursor.fetchall()
+
+    # Build preferences dict
+    preferences = {}
+    categories = {}
+
+    for row in rows:
+        key = row["preference_key"]
+        value = parse_preference_value(
+            row["preference_value"],
+            PreferenceType(row["preference_type"])
+        )
+        category = row["category"] or "general"
+
+        preferences[key] = value
+
+        if category not in categories:
+            categories[category] = []
+        categories[category].append(key)
+
+    # If no preferences exist, return defaults
+    if not preferences:
+        # Flatten default settings; use cat_settings to avoid shadowing app_settings
+        for category, cat_settings in DEFAULT_SETTINGS.items():
+            categories[category] = list(cat_settings.keys())
+            for key, value in cat_settings.items():
+                preferences[f"{category}.{key}"] = value
+
+    return SettingsResponse(
+        preferences=preferences,
+        categories=categories
+    )
+
+
+@router.get("/storage", response_model=StorageResponse)
+async def get_storage_summary(
+    user_id: int = Depends(get_current_user_id),
+) -> StorageResponse:
+    """Return local generated storage locations and sizes."""
+    # Directory walks can take seconds on large caches; keep the loop free.
+    return await asyncio.to_thread(_storage_response)
+
+
+@router.post("/storage/clear-cache", response_model=ClearCacheResponse)
+async def clear_generated_cache(
+    confirm: bool = Query(False, description="Must be true to clear cache/temp files."),
+    user_id: int = Depends(get_current_user_id),
+) -> ClearCacheResponse:
+    """Clear app-owned cache/temp directories without deleting sessions, settings, or DB."""
+    if not confirm:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Confirmation is required to clear generated cache (set ?confirm=true)",
+        )
+
+    def _clear_all() -> Tuple[int, int]:
+        files_total = 0
+        bytes_total = 0
+        for _, (path, clearable) in _managed_storage_dirs().items():
+            if not clearable:
+                continue
+            files, size_bytes = _clear_directory_contents(path)
+            files_total += files
+            bytes_total += size_bytes
+        return files_total, bytes_total
+
+    cleared_files, cleared_bytes = await asyncio.to_thread(_clear_all)
+
+    return ClearCacheResponse(
+        cleared_files=cleared_files,
+        cleared_bytes=cleared_bytes,
+        areas=(await asyncio.to_thread(_storage_response)).areas,
+    )
+
+
+@router.get("/{preference_key}", response_model=PreferenceResponse)
+async def get_preference(
+    preference_key: str,
+    db: aiosqlite.Connection = Depends(get_db),
+    user_id: int = Depends(get_current_user_id)
+) -> PreferenceResponse:
+    """
+    Get a specific preference by key.
+
+    Args:
+        preference_key: Preference key
+        db: Database connection
+        user_id: Current user ID
+
+    Returns:
+        Preference value
+
+    Raises:
+        HTTPException: If preference not found
+    """
+    cursor = await db.execute(
+        """
+        SELECT preference_key, preference_value, preference_type, category
+        FROM user_preferences
+        WHERE user_id = ? AND preference_key = ?
+        """,
+        (user_id, preference_key)
+    )
+    row = await cursor.fetchone()
+
+    if row is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Preference '{preference_key}' not found"
+        )
+
+    pref_type = PreferenceType(row["preference_type"])
+    value = parse_preference_value(row["preference_value"], pref_type)
+
+    return PreferenceResponse(
+        key=row["preference_key"],
+        value=value,
+        type=pref_type,
+        category=row["category"]
+    )
+
+
+@router.put("", response_model=SettingsResponse)
+async def update_settings(
+    updates: BulkPreferenceUpdate,
+    db: aiosqlite.Connection = Depends(get_db),
+    user_id: int = Depends(get_current_user_id)
+) -> SettingsResponse:
+    """
+    Update multiple settings at once.
+
+    Args:
+        updates: Bulk preference updates
+        db: Database connection
+        user_id: Current user ID
+
+    Returns:
+        Updated settings
+    """
+    now = utc_now()
+
+    for key, value in updates.preferences.items():
+        # Determine category from key (e.g., "theme.mode" -> "theme")
+        parts = key.split('.', 1)
+        category = parts[0] if len(parts) > 1 else "general"
+
+        # Serialize value
+        serialized_value, pref_type = serialize_preference_value(value)
+
+        # Check if preference exists
+        cursor = await db.execute(
+            "SELECT id FROM user_preferences WHERE user_id = ? AND preference_key = ?",
+            (user_id, key)
+        )
+        existing = await cursor.fetchone()
+
+        if existing:
+            # Update existing preference
+            await db.execute(
+                """
+                UPDATE user_preferences
+                SET preference_value = ?, preference_type = ?, updated_at = ?
+                WHERE id = ?
+                """,
+                (serialized_value, pref_type.value, now.isoformat(), existing["id"])
+            )
+        else:
+            # Insert new preference
+            await db.execute(
+                """
+                INSERT INTO user_preferences (
+                    user_id, preference_key, preference_value,
+                    preference_type, category, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    user_id, key, serialized_value,
+                    pref_type.value, category,
+                    now.isoformat(), now.isoformat()
+                )
+            )
+
+    await db.commit()
+
+    # Return updated settings
+    return await get_settings(db, user_id)
+
+
+@router.put("/{preference_key}", response_model=PreferenceResponse)
+async def update_preference(
+    preference_key: str,
+    value: Any,
+    db: aiosqlite.Connection = Depends(get_db),
+    user_id: int = Depends(get_current_user_id)
+) -> PreferenceResponse:
+    """
+    Update a single preference.
+
+    Args:
+        preference_key: Preference key
+        value: New value
+        db: Database connection
+        user_id: Current user ID
+
+    Returns:
+        Updated preference
+    """
+    now = utc_now()
+
+    # Determine category from key
+    parts = preference_key.split('.', 1)
+    category = parts[0] if len(parts) > 1 else "general"
+
+    # Serialize value
+    serialized_value, pref_type = serialize_preference_value(value)
+
+    # Check if preference exists
+    cursor = await db.execute(
+        "SELECT id FROM user_preferences WHERE user_id = ? AND preference_key = ?",
+        (user_id, preference_key)
+    )
+    existing = await cursor.fetchone()
+
+    if existing:
+        # Update existing preference
+        await db.execute(
+            """
+            UPDATE user_preferences
+            SET preference_value = ?, preference_type = ?, updated_at = ?
+            WHERE id = ?
+            """,
+            (serialized_value, pref_type.value, now.isoformat(), existing["id"])
+        )
+    else:
+        # Insert new preference
+        await db.execute(
+            """
+            INSERT INTO user_preferences (
+                user_id, preference_key, preference_value,
+                preference_type, category, created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                user_id, preference_key, serialized_value,
+                pref_type.value, category,
+                now.isoformat(), now.isoformat()
+            )
+        )
+
+    await db.commit()
+
+    return PreferenceResponse(
+        key=preference_key,
+        value=value,
+        type=pref_type,
+        category=category
+    )
+
+
+@router.post("/reset", response_model=SettingsResponse)
+async def reset_settings(
+    db: aiosqlite.Connection = Depends(get_db),
+    user_id: int = Depends(get_current_user_id)
+) -> SettingsResponse:
+    """
+    Reset all settings to defaults.
+
+    Args:
+        db: Database connection
+        user_id: Current user ID
+
+    Returns:
+        Default settings
+    """
+    # Delete all user preferences
+    await db.execute(
+        "DELETE FROM user_preferences WHERE user_id = ?",
+        (user_id,)
+    )
+
+    # Insert default preferences
+    now = utc_now()
+
+    for category, cat_settings in DEFAULT_SETTINGS.items():
+        for key, value in cat_settings.items():
+            full_key = f"{category}.{key}"
+            serialized_value, pref_type = serialize_preference_value(value)
+
+            await db.execute(
+                """
+                INSERT INTO user_preferences (
+                    user_id, preference_key, preference_value,
+                    preference_type, category, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    user_id, full_key, serialized_value,
+                    pref_type.value, category,
+                    now.isoformat(), now.isoformat()
+                )
+            )
+
+    await db.commit()
+
+    # Return default settings
+    return await get_settings(db, user_id)
+
+
+@router.delete("/{preference_key}", status_code=status.HTTP_204_NO_CONTENT)
+async def delete_preference(
+    preference_key: str,
+    db: aiosqlite.Connection = Depends(get_db),
+    user_id: int = Depends(get_current_user_id)
+):
+    """
+    Delete a specific preference.
+
+    Args:
+        preference_key: Preference key
+        db: Database connection
+        user_id: Current user ID
+
+    Raises:
+        HTTPException: If preference not found
+    """
+    cursor = await db.execute(
+        "DELETE FROM user_preferences WHERE user_id = ? AND preference_key = ?",
+        (user_id, preference_key)
+    )
+    await db.commit()
+
+    if cursor.rowcount == 0:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Preference '{preference_key}' not found"
+        )

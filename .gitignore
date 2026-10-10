@@ -1,0 +1,90 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+/lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+MANIFEST
+venv/
+env/
+ENV/
+.venv
+
+.puku/
+puku/
+.puku/
+.puku/**
+!/.puku/.gitkeep
+
+# FastAPI
+.pytest_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+*.log
+
+# Node
+node_modules/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+.pnpm-debug.log*
+dist/
+dist-ssr/
+*.local
+
+# IDEs
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# Environment variables
+.env
+.env.local
+.env.*.local
+
+# Session files
+shared/sessions/*.yaml
+!shared/sessions/.gitkeep
+
+# Local runtime storage (SQLite DB, key file, caches, uploads)
+storage/
+
+# Logs
+logs/
+*.log
+
+# Testing
+coverage/
+.nyc_output/
+
+# Build
+build/
+*.tsbuildinfo
+!desktop/build/
+!desktop/build/generate-icon.ps1
+!desktop/build/icon.ico
+!desktop/build/icon.png
+
+# Temporary files
+tmp/
+temp/
+*.tmp

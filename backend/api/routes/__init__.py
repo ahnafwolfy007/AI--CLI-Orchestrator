@@ -1,0 +1,33 @@
+"""
+API routes package for AI Orchestrator Backend.
+Contains all API endpoint implementations.
+"""
+
+# Import all route modules for easy access
+from backend.api.routes import (
+    sessions,
+    providers,
+    orchestrator,
+    runtimes,
+    workspace,
+    analytics,
+    settings,
+    onboarding,
+    agents,
+    tools,
+    installer,
+)
+
+__all__ = [
+    "sessions",
+    "providers",
+    "orchestrator",
+    "runtimes",
+    "workspace",
+    "analytics",
+    "settings",
+    "onboarding",
+    "agents",
+    "tools",
+    "installer",
+]
